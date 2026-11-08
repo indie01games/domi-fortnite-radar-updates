@@ -1,0 +1,61 @@
+name: Publish RADAR update
+on:
+  push:
+    branches: [main]
+    paths: [release-publication.json]
+permissions:
+  contents: write
+concurrency:
+  group: radar-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate and publish prepared update
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, io, json, os, pathlib, re, subprocess, zipfile
+          repo=os.environ['GITHUB_REPOSITORY']
+          commit=os.environ['GITHUB_SHA']
+          def gh(*args,check=True):
+              return subprocess.run(['gh',*args],check=check,text=True,capture_output=True)
+          response=gh('api','--method','GET',f'repos/{repo}/contents/release-publication.json','-f',f'ref={commit}')
+          payload=json.loads(base64.b64decode(json.loads(response.stdout)['content']))
+          assert payload['app_id']=='domi-fortnite-radar'
+          version=payload['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          body=base64.b64decode(payload['archive_b64'],validate=True)
+          assert len(body)<=20_000_000
+          assert hashlib.sha256(body).hexdigest()==payload['sha256']
+          with zipfile.ZipFile(io.BytesIO(body)) as archive:
+              assert archive.testzip() is None
+              prefix='DOMI-FORTNITE-RADAR/'
+              manifest=json.loads(archive.read(prefix+'update-manifest.json'))
+              assert manifest['app_id']==payload['app_id'] and manifest['version']==version
+              assert set(archive.namelist())=={prefix+n for n in manifest['files']}|{prefix+'update-manifest.json'}
+              for name,digest in manifest['files'].items():
+                  path=pathlib.PurePosixPath(name)
+                  assert not path.is_absolute() and '..' not in path.parts and '\\' not in name
+                  data=archive.read(prefix+name)
+                  assert hashlib.sha256(data).hexdigest()==digest
+                  if name.endswith('.py'):compile(data,name,'exec')
+          filename=f'DOMI-FORTNITE-RADAR-v{version}.zip'
+          pathlib.Path(filename).write_bytes(body)
+          feed=dict(app_id=payload['app_id'],version=version,sha256=payload['sha256'],zip_url=f'https://github.com/{repo}/releases/download/v{version}/{filename}')
+          pathlib.Path('latest.json').write_text(json.dumps(feed,ensure_ascii=False),encoding='utf-8')
+          pathlib.Path('notes.md').write_text(payload['notes'],encoding='utf-8')
+          previous=gh('release','view',f'v{version}','--repo',repo,'--json','isDraft',check=False)
+          if previous.returncode==0:
+              assert json.loads(previous.stdout)['isDraft'],'Published release is immutable'
+              gh('release','upload',f'v{version}',filename,'latest.json','--repo',repo,'--clobber')
+          else:
+              gh('release','create',f'v{version}',filename,'latest.json','--repo',repo,'--target',commit,'--draft','--title',f'DOMI FORTNITE RADAR v{version}','--notes-file','notes.md')
+          gh('release','edit',f'v{version}','--repo',repo,'--draft=false','--latest')
+          print(f'Published https://github.com/{repo}/releases/tag/v{version}')
+          PY
+
